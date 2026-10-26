@@ -2,7 +2,12 @@ package com.dotsketch.ui
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.graphics.Canvas as AndroidCanvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path as AndroidPath
 import android.net.Uri
+import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.dotsketch.core.BitmapLoader
@@ -31,11 +36,19 @@ enum class ExportFormat(val extension: String, val mime: String) {
     PNG("png", "image/png")
 }
 
+enum class EditorMode { PHOTO, DRAW }
+
 data class ShareRequest(val path: String, val mime: String)
+
+/** One freehand stroke as a list of points (Compose coordinates). */
+data class Stroke(val points: List<Offset>)
 
 data class EditorUiState(
     val settings: UserSettings = UserSettings(),
+    val mode: EditorMode = EditorMode.PHOTO,
     val bitmap: Bitmap? = null,
+    val strokes: List<Stroke> = emptyList(),
+    val currentStroke: List<Offset> = emptyList(),
     val layout: PageLayoutResult? = null,
     val busy: Boolean = false,
     val message: String? = null,
@@ -55,16 +68,34 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private var cachedOptions: ProcessOptions? = null
     private var cachedResult: ProcessResult? = null
 
+    fun setMode(mode: EditorMode) {
+        _state.update {
+            it.copy(
+                mode = mode,
+                message = null,
+                // clear the other source when switching
+                bitmap = if (mode == EditorMode.DRAW) null else it.bitmap,
+                strokes = if (mode == EditorMode.PHOTO) emptyList() else it.strokes,
+                currentStroke = emptyList(),
+                layout = null
+            )
+        }
+        if (mode == EditorMode.PHOTO && _state.value.bitmap != null) recompute()
+    }
+
     fun update(transform: (UserSettings) -> UserSettings) {
         val newSettings = transform(_state.value.settings)
         _state.update { it.copy(settings = newSettings) }
         prefs.save(newSettings)
-        recompute()
+        // Only recompute if we already have something to process
+        if (_state.value.bitmap != null || _state.value.strokes.isNotEmpty()) {
+            recompute()
+        }
     }
 
     fun loadImage(uri: Uri) {
         viewModelScope.launch {
-            _state.update { it.copy(busy = true, message = null) }
+            _state.update { it.copy(busy = true, message = null, mode = EditorMode.PHOTO) }
             val bmp = try {
                 withContext(Dispatchers.IO) { BitmapLoader.load(getApplication(), uri) }
             } catch (e: Exception) {
@@ -73,11 +104,157 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             if (bmp == null) {
                 _state.update { it.copy(busy = false, message = "Couldn't open that image.") }
             } else {
-                _state.update { it.copy(bitmap = bmp) }
+                _state.update {
+                    it.copy(
+                        bitmap = bmp,
+                        strokes = emptyList(),
+                        currentStroke = emptyList()
+                    )
+                }
                 recompute()
             }
         }
     }
+
+    // ── Drawing ──────────────────────────────────────────────────────────────
+
+    fun startStroke(point: Offset) {
+        _state.update { it.copy(currentStroke = listOf(point), message = null) }
+    }
+
+    fun addPoint(point: Offset) {
+        _state.update { it.copy(currentStroke = it.currentStroke + point) }
+    }
+
+    fun endStroke() {
+        val pts = _state.value.currentStroke
+        if (pts.size >= 2) {
+            _state.update {
+                it.copy(
+                    strokes = it.strokes + Stroke(pts),
+                    currentStroke = emptyList()
+                )
+            }
+        } else {
+            _state.update { it.copy(currentStroke = emptyList()) }
+        }
+    }
+
+    fun undoStroke() {
+        _state.update {
+            if (it.currentStroke.isNotEmpty()) {
+                it.copy(currentStroke = emptyList())
+            } else if (it.strokes.isNotEmpty()) {
+                it.copy(strokes = it.strokes.dropLast(1), layout = null)
+            } else it
+        }
+    }
+
+    fun clearStrokes() {
+        _state.update {
+            it.copy(
+                strokes = emptyList(),
+                currentStroke = emptyList(),
+                layout = null,
+                message = null
+            )
+        }
+    }
+
+    /** Rasterise the freehand strokes into a Bitmap and run the normal pipeline. */
+    fun convertDrawing() {
+        val snapshot = _state.value
+        if (snapshot.strokes.isEmpty() && snapshot.currentStroke.isEmpty()) {
+            _state.update { it.copy(message = "Draw something first.") }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, message = null) }
+            try {
+                val bmp = withContext(Dispatchers.Default) {
+                    // Fixed working resolution – high enough for clean contours
+                    val size = 1200
+                    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                    val canvas = AndroidCanvas(bitmap)
+                    canvas.drawColor(Color.WHITE)
+
+                    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.BLACK
+                        style = Paint.Style.STROKE
+                        strokeWidth = 8f          // ~2 mm-ish at this resolution
+                        strokeCap = Paint.Cap.ROUND
+                        strokeJoin = Paint.Join.ROUND
+                    }
+
+                    // We don't know the exact canvas size the user drew on,
+                    // so we normalise all points into [0..1] then scale to the bitmap.
+                    // For simplicity we assume the drawing canvas was square and
+                    // we just map the bounding box.
+                    val allPoints = (snapshot.strokes.flatMap { it.points } + snapshot.currentStroke)
+                    if (allPoints.isEmpty()) return@withContext null
+
+                    var minX = Float.MAX_VALUE
+                    var minY = Float.MAX_VALUE
+                    var maxX = Float.MIN_VALUE
+                    var maxY = Float.MIN_VALUE
+                    allPoints.forEach { p ->
+                        if (p.x < minX) minX = p.x
+                        if (p.y < minY) minY = p.y
+                        if (p.x > maxX) maxX = p.x
+                        if (p.y > maxY) maxY = p.y
+                    }
+                    val pad = 40f
+                    val w = (maxX - minX).coerceAtLeast(1f) + 2 * pad
+                    val h = (maxY - minY).coerceAtLeast(1f) + 2 * pad
+                    val scale = size / maxOf(w, h)
+
+                    fun map(p: Offset): android.graphics.PointF {
+                        val x = (p.x - minX + pad) * scale
+                        val y = (p.y - minY + pad) * scale
+                        return android.graphics.PointF(x, y)
+                    }
+
+                    fun drawStroke(points: List<Offset>) {
+                        if (points.size < 2) return
+                        val path = AndroidPath()
+                        val first = map(points.first())
+                        path.moveTo(first.x, first.y)
+                        for (i in 1 until points.size) {
+                            val pt = map(points[i])
+                            path.lineTo(pt.x, pt.y)
+                        }
+                        canvas.drawPath(path, paint)
+                    }
+
+                    snapshot.strokes.forEach { drawStroke(it.points) }
+                    if (snapshot.currentStroke.isNotEmpty()) drawStroke(snapshot.currentStroke)
+
+                    bitmap
+                }
+
+                if (bmp == null) {
+                    _state.update { it.copy(busy = false, message = "Nothing to convert.") }
+                    return@launch
+                }
+
+                // Treat the rasterised drawing exactly like a loaded photo
+                cachedBitmap = null
+                cachedResult = null
+                _state.update {
+                    it.copy(
+                        bitmap = bmp,
+                        // keep the strokes so the user can still see / edit them
+                        mode = EditorMode.DRAW
+                    )
+                }
+                recompute()
+            } catch (e: Exception) {
+                _state.update { it.copy(busy = false, message = "Convert failed: ${e.message}") }
+            }
+        }
+    }
+
+    // ── Processing ───────────────────────────────────────────────────────────
 
     private fun recompute() {
         job?.cancel()
@@ -116,7 +293,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun export(format: ExportFormat) {
         val layout = _state.value.layout
         if (layout == null || layout.dots.isEmpty()) {
-            _state.update { it.copy(message = "Nothing to export yet. Pick an image first.") }
+            _state.update { it.copy(message = "Nothing to export yet. Draw or pick an image first.") }
             return
         }
         viewModelScope.launch {
